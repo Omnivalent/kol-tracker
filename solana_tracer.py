@@ -826,7 +826,60 @@ def realized(trades):
                 t["pnl"] = t["sol"] - basis
     pnl = sum(t.get("pnl", 0.0) for t in trades)
     return {"realized_sol": pnl, "spent_sol": spent, "received_sol": got, "held_tokens": held,
-            "free_tokens_in": free_in}
+            "free_tokens_in": free_in, "cost_left_sol": cost}
+
+
+def current_price(mint, pump):
+    """Current price in SOL per token, and where it was read: the pump.fun curve's reserves if the coin
+    has not graduated, else the pool holding the largest balance of the token (its SOL / token reserves)."""
+    import base64
+    if pump and not pump["graduated"]:
+        d = base64.b64decode(rpc("getAccountInfo", [pump["curve"], {"encoding": "base64"}])["value"]["data"][0])
+        vtok, vsol = int.from_bytes(d[8:16], "little"), int.from_bytes(d[16:24], "little")
+        return (vsol / 1e9) / (vtok / 1e6), f"bonding curve {pump['curve']}"
+    # Recent swaps of the mint: median price paid/received by the traders who signed them.
+    # (Pool reserve ratios are wrong for concentrated-liquidity pools, so they are not used.)
+    try:
+        sigs = [x for x in rpc("getSignaturesForAddress", [mint, {"limit": 60}]) if not x.get("err")]
+    except Exception:
+        sigs = []
+    prices, last = [], None
+    for x, tx in zip(sigs, pmap(lambda x: get_tx(x["signature"]), sigs)):
+        if not tx:
+            continue
+        td, wd = token_deltas(tx, mint), token_deltas(tx, WSOL)
+        # the pool side of a swap: one account owner whose token and wrapped-SOL balances moved in opposite
+        # directions (most trades here go through routers, so the signer's own balance often does not move)
+        for w in set(td) & set(wd):
+            tok, sol = td[w], wd[w]
+            if abs(tok) > 0 and sol * tok < 0 and abs(sol) >= 0.05:  # skip dust trades
+                prices.append(abs(sol / tok))
+                last = last or x["signature"]
+    if len(prices) >= 3:
+        prices.sort()
+        return prices[len(prices) // 2], f"median of {len(prices)} recent swaps (newest tx {last})"
+    for acc in rpc("getTokenLargestAccounts", [mint])["value"][:5]:
+        info = rpc("getAccountInfo", [acc["address"], {"encoding": "jsonParsed"}])["value"]["data"]["parsed"]["info"]
+        owner, tok = info["owner"], float(info["tokenAmount"]["uiAmountString"])
+        if on_curve(owner) or tok <= 0:
+            continue  # a person, not a pool
+        sol = 0.0
+        for a in rpc("getTokenAccountsByOwner", [owner, {"mint": WSOL}, {"encoding": "jsonParsed"}])["value"]:
+            sol += float(a["account"]["data"]["parsed"]["info"]["tokenAmount"]["uiAmountString"])
+        if sol > 0:
+            return sol / tok, f"pool {owner} ({sol:,.2f} SOL / {tok:,.0f} tokens)"
+    return None, "no pool found"
+
+
+def top_holders(mint, n=20):
+    """Owners of the largest token accounts that are real wallets (pools and vaults skipped)."""
+    out = []
+    for acc in rpc("getTokenLargestAccounts", [mint])["value"][:n]:
+        v = rpc("getAccountInfo", [acc["address"], {"encoding": "jsonParsed"}])["value"]
+        owner = v["data"]["parsed"]["info"]["owner"] if v else None
+        if owner and on_curve(owner):
+            out.append(owner)
+    return out
 
 
 def pnl_mode(a):
@@ -893,6 +946,18 @@ def pnl_mode(a):
                      f"low-cap buyers (--max-wallets).")
         cands = cands[: a.max_wallets]
 
+    price_now, price_src = current_price(mint, pump)
+    if a.unrealized:
+        try:
+            holders = [w for w in top_holders(mint) if w not in cands]
+        except Exception:
+            holders = []
+            notes.append("Current top holders could not be read (RPC refused): only curve-era buyers are ranked.")
+        if holders:
+            notes.append(f"Added {len(holders)} current top holders (they may have bought after graduation).")
+        cands += holders
+        if price_now is None:
+            notes.append("Could not read the current price: unrealized PnL left out.")
     log(f"Reading every trade of {len(cands)} wallets in this token ...")
     res = {}
     for w, r in zip(cands, pmap(lambda w: wallet_trades(w, mint, token_program), cands)):
@@ -900,11 +965,18 @@ def pnl_mode(a):
             continue
         trades, done, ata = r
         st = realized(trades)
-        st.update({"trades": trades, "complete": done, "ata": ata, "low_cap_tokens": low_buys[w],
+        st.update({"trades": trades, "complete": done, "ata": ata, "low_cap_tokens": low_buys.get(w, 0.0),
                    "first_buy": first_buy.get(w)})
+        st["unrealized_sol"] = (st["held_tokens"] * price_now - st["cost_left_sol"]) if price_now else 0.0
+        st["value_now_sol"] = st["held_tokens"] * price_now if price_now else 0.0
         res[w] = st
     ranked = sorted(res, key=lambda w: -res[w]["realized_sol"])
     top = [w for w in ranked if res[w]["realized_sol"] > 0][: a.top]
+    top_unreal = []
+    if a.unrealized and price_now:
+        top_unreal = [w for w in sorted(res, key=lambda w: -res[w]["unrealized_sol"])
+                      if res[w]["unrealized_sol"] > 0][: a.top]
+        top += [w for w in top_unreal if w not in top]
 
     # ---- links between top wallets and their neighbours
     links = []  # (a, b, strength, text)
@@ -1037,7 +1109,10 @@ def pnl_mode(a):
         print(f"NOTE: {n}")
     print("NOTE: USD figures use the launch SOL price; sells at other times were worth more or less in USD.")
 
-    print(f"\n--- TOP {len(top)} BY REALIZED PROFIT (SOL, average cost) ---")
+    if a.unrealized:
+        print(f"Current price: {price_now} SOL per token, from {price_src}" if price_now else "Current price: unknown")
+    print(f"\n--- TOP {len(top)} BY REALIZED PROFIT" + (" + TOP BY UNREALIZED" if top_unreal else "")
+          + " (SOL, average cost) ---")
     for i, w in enumerate(top, 1):
         r, fb = res[w], res[w]["first_buy"] or {}
         nb = sum(1 for t in r["trades"] if t["kind"] == "BUY")
@@ -1047,9 +1122,11 @@ def pnl_mode(a):
             flag.append(f"received {r['free_tokens_in']:,.0f} tokens for free (profit may be inflated)")
         if not r["complete"]:
             flag.append("token account history not fully read")
-        print(f"\n{i}. {w}")
+        print(f"\n{i}. {w}" + ("   [top unrealized]" if w in top_unreal else ""))
         print(f"   realized {r['realized_sol']:+.3f} SOL ({usd(r['realized_sol'])})   spent {r['spent_sol']:.3f}  "
               f"received {r['received_sol']:.3f} SOL   buys {nb} sells {ns}   still holds {r['held_tokens']:,.0f}")
+        if a.unrealized and price_now:
+            print(f"   unrealized {r['unrealized_sol']:+.3f} SOL (holding worth {r['value_now_sol']:.3f} SOL now)")
         if fb:
             print(f"   first buy at {fb['mc_sol'] * sol_usd / 1000:,.1f}k USD market cap @ {ts(fb['time'])}  tx {fb['sig']}")
         if w in funds and funds[w]:
@@ -1086,16 +1163,18 @@ def pnl_mode(a):
         wr = csv.writer(fh)
         wr.writerow(["rank", "wallet", "realized_sol", "realized_usd_at_launch_price", "spent_sol", "received_sol",
                      "held_tokens", "first_buy_mc_usd", "first_buy_time_utc", "first_buy_sig", "funder",
-                     "free_tokens_in", "history_complete"])
+                     "free_tokens_in", "history_complete", "unrealized_sol", "value_now_sol"])
         for i, w in enumerate(ranked, 1):
             r, fb, f = res[w], res[w]["first_buy"] or {}, funds.get(w) or {}
             wr.writerow([i, w, round(r["realized_sol"], 6), round(r["realized_sol"] * sol_usd, 2),
                          round(r["spent_sol"], 6), round(r["received_sol"], 6), r["held_tokens"],
                          round(fb.get("mc_sol", 0) * sol_usd), ts(fb.get("time")), fb.get("sig", ""),
-                         f.get("funder", ""), r["free_tokens_in"], r["complete"]])
+                         f.get("funder", ""), r["free_tokens_in"], r["complete"],
+                         round(r.get("unrealized_sol", 0), 6), round(r.get("value_now_sol", 0), 6)])
     with open(base + ".json", "w") as fh:
         json.dump({"mint": mint, "source": source, "sol_usd": sol_usd, "max_mc_usd": a.max_mc_usd, "notes": notes,
-                   "top": top, "wallets": res, "funders": funds, "chains": chains,
+                   "top": top, "top_unrealized": top_unreal, "price_now_sol": price_now, "price_source": price_src,
+                   "wallets": res, "funders": funds, "chains": chains,
                    "generated": int(time.time()),
                    "links": [{"a": x, "b": y, "strength": s, "evidence": t} for x, y, s, t in links]}, fh, indent=1)
     print(f"\nSaved {base}.csv (all {len(ranked)} wallets ranked) and {base}.json")
@@ -1444,6 +1523,8 @@ def main():
     q.add_argument("--pages", type=int, default=60)
     q.add_argument("--hub-threshold", type=int, default=1000)
     q.add_argument("--labels")
+    q.add_argument("--unrealized", action="store_true",
+                   help="also rank by unrealized PnL at the current price, and include current top holders")
     k = sub.add_parser("sides", help="find likely side wallets of a KOL (or every KOL in kols.csv)")
     k.add_argument("wallet", nargs="?", help="one wallet; omit to scan kols.csv")
     k.add_argument("--kols", default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "kols.csv"))
