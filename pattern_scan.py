@@ -53,8 +53,16 @@ def wallet_coins(w, n):
             break
         before = page[-1]["signature"]
     sigs = sigs[:n]
+    txs = T.pmap(lambda s: T.get_tx(s["signature"]), sigs)
+    for attempt in range(2):  # retry failed downloads, more slowly
+        miss = [i for i, t in enumerate(txs) if t is None]
+        if not miss:
+            break
+        time.sleep(5 * (attempt + 1))
+        for i, t in zip(miss, T.pmap(lambda i: T.get_tx(sigs[i]["signature"]), miss)):
+            txs[i] = t
     coins = defaultdict(list)
-    for s, tx in zip(sigs, T.pmap(lambda s: T.get_tx(s["signature"]), sigs)):
+    for s, tx in zip(sigs, txs):
         if not tx:
             continue
         for m, tok in own_mint_deltas(tx, w).items():
@@ -68,6 +76,7 @@ def wallet_coins(w, n):
             coins[m].append({"kind": kind, "tokens": abs(tok), "sol": sol, "sig": s["signature"],
                              "time": tx.get("blockTime"), "counterparty": cp[0] if kind.startswith("XFER") and cp else None})
     return {"coins": dict(coins), "txs_read": len(sigs),
+            "missing_txs": [sigs[i]["signature"] for i, t in enumerate(txs) if t is None],
             "oldest": min((s.get("blockTime") or 0) for s in sigs) if sigs else None}
 
 
