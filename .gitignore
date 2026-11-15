@@ -1,0 +1,7 @@
+__pycache__/
+trace_token_*
+trace_wallet_*
+pnl_*
+sides_*.json
+labels_test.csv
+site/data/*.tmp
