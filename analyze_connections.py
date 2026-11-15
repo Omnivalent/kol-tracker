@@ -66,8 +66,8 @@ def main():
         parts = []
         if w in kols:
             parts.append(f"KOL {kols[w]}")
-        if w in watch and watch[w]["names"]:
-            parts.append(" / ".join(watch[w]["names"][:3]))
+        if w in watch:
+            parts.append(" / ".join(watch[w]["names"][:3]) if watch[w]["names"] else "your list, no name")
         return " · ".join(parts) or "(unnamed)"
 
     # busy status for wallets we need to judge
