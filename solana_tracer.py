@@ -840,7 +840,7 @@ def current_price(mint, pump):
     # Recent swaps of the mint: median price paid/received by the traders who signed them.
     # (Pool reserve ratios are wrong for concentrated-liquidity pools, so they are not used.)
     try:
-        sigs = [x for x in rpc("getSignaturesForAddress", [mint, {"limit": 60}]) if not x.get("err")]
+        sigs = [x for x in rpc("getSignaturesForAddress", [mint, {"limit": 200}]) if not x.get("err")]
     except Exception:
         sigs = []
     prices, last = [], None
@@ -858,17 +858,7 @@ def current_price(mint, pump):
     if len(prices) >= 3:
         prices.sort()
         return prices[len(prices) // 2], f"median of {len(prices)} recent swaps (newest tx {last})"
-    for acc in rpc("getTokenLargestAccounts", [mint])["value"][:5]:
-        info = rpc("getAccountInfo", [acc["address"], {"encoding": "jsonParsed"}])["value"]["data"]["parsed"]["info"]
-        owner, tok = info["owner"], float(info["tokenAmount"]["uiAmountString"])
-        if on_curve(owner) or tok <= 0:
-            continue  # a person, not a pool
-        sol = 0.0
-        for a in rpc("getTokenAccountsByOwner", [owner, {"mint": WSOL}, {"encoding": "jsonParsed"}])["value"]:
-            sol += float(a["account"]["data"]["parsed"]["info"]["tokenAmount"]["uiAmountString"])
-        if sol > 0:
-            return sol / tok, f"pool {owner} ({sol:,.2f} SOL / {tok:,.0f} tokens)"
-    return None, "no pool found"
+    return None, "too few recent swaps to read a price"
 
 
 def top_holders(mint, n=20):
