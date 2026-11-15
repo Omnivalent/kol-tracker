@@ -901,6 +901,17 @@ def pnl_mode(a):
     ok = [s for s in sigs if not s.get("err")][::-1]
     log(f"Reading {len(ok)} trades ...")
     txs = pmap(lambda s: get_tx(s["signature"]), ok)
+    for attempt in range(3):  # retry the downloads that failed, more slowly
+        miss = [i for i, t in enumerate(txs) if t is None]
+        if not miss:
+            break
+        log(f"Retrying {len(miss)} trades that failed to download ...")
+        time.sleep(5 * (attempt + 1))
+        for i, t in zip(miss, pmap(lambda i: get_tx(ok[i]["signature"]), miss)):
+            txs[i] = t
+    miss = [ok[i]["signature"] for i, t in enumerate(txs) if t is None]
+    if miss:
+        notes.append(f"{len(miss)} trades could not be downloaded and are left out: " + ", ".join(miss))
 
     sol_usd = a.sol_usd
     if not sol_usd and ok:
