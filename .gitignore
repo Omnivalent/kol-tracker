@@ -5,3 +5,4 @@ pnl_*
 sides_*.json
 labels_test.csv
 site/data/*.tmp
+private/
