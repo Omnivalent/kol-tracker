@@ -291,12 +291,18 @@ def scan_wallet(wallet, num_txs):
 
     all_transfers = []
     all_lp_events = []
+    signer_counts = defaultdict(int)  # track who signs txs referencing this wallet
     for tx in txs:
         if not tx:
             continue
         transfers, lp_events = extract_all_transfers(tx, wallet)
         all_transfers.extend(transfers)
         all_lp_events.extend(lp_events)
+        # Track signers — if our wallet is referenced but not signing,
+        # the signers are potential operating wallets
+        for signer in T.signers_of(tx):
+            if signer != wallet:
+                signer_counts[signer] += 1
 
     # Aggregate by counterparty
     partners = defaultdict(lambda: {
@@ -334,7 +340,17 @@ def scan_wallet(wallet, num_txs):
     for cp, p in partners.items():
         p["sigs"] = list(p["sigs"])
 
-    return dict(partners), len(sigs), sum(1 for t in txs if t is None), all_lp_events
+    # If wallet has very few direct transfers but many txs, the signers ARE the side wallets
+    # (pattern: wallet is used as authority/referral, actual trading done by signer wallets)
+    signer_wallets = []
+    if len(all_transfers) < len(sigs) * 0.05 and signer_counts:
+        T.log(f"  ! Low direct transfer ratio ({len(all_transfers)}/{len(sigs)}) — checking signer wallets")
+        for signer, count in sorted(signer_counts.items(), key=lambda x: -x[1]):
+            if count >= 2 and T.on_curve(signer):
+                signer_wallets.append({"address": signer, "tx_count": count})
+                T.log(f"    Signer: {signer} ({count} txs)")
+
+    return dict(partners), len(sigs), sum(1 for t in txs if t is None), all_lp_events, signer_wallets
 
 
 def find_side_wallets(partners, sol_usd, min_sol_usd=500):
@@ -469,7 +485,7 @@ def main():
 
         T.log(f"[{i}/{len(wallets)}] Scanning {name} ({addr[:16]}...)")
         try:
-            partners, num_sigs, missing, lp_events = scan_wallet(addr, a.txs)
+            partners, num_sigs, missing, lp_events, signer_wallets = scan_wallet(addr, a.txs)
             sides = find_side_wallets(partners, a.sol_usd)
             result = {
                 "name": name,
@@ -477,6 +493,7 @@ def main():
                 "txs_scanned": num_sigs,
                 "txs_missing": missing,
                 "side_wallets": sides,
+                "signer_wallets": signer_wallets,
                 "all_partners_count": len(partners),
                 "lp_events": lp_events,
             }
